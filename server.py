@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Google GSC + GA4 MCP Server
-A simple server that lets Claude talk to your Search Console and Analytics data.
+Connects Claude to your Search Console and Analytics data.
 """
 
 import os
 import json
-import base64
+from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
@@ -18,7 +18,6 @@ from mcp.server.sse import SseServerTransport
 from starlette.routing import Route
 
 # ========== SETUP ==========
-# Read the service account JSON from environment variable
 SCOPES = [
     'https://www.googleapis.com/auth/webmasters.readonly',
     'https://www.googleapis.com/auth/analytics.readonly',
@@ -26,13 +25,16 @@ SCOPES = [
 ]
 
 def get_credentials():
-    """Create credentials from the service account JSON stored in env."""
-    creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_B64")
-    if not creds_b64:
-        raise ValueError("Missing GOOGLE_CREDENTIALS_B64 environment variable!")
+    """Create credentials from the raw service account JSON stored in env."""
+    creds_json_str = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not creds_json_str:
+        raise ValueError("Missing GOOGLE_CREDENTIALS_JSON environment variable!")
     
-    creds_json = base64.b64decode(creds_b64).decode('utf-8')
-    creds_info = json.loads(creds_json)
+    try:
+        creds_info = json.loads(creds_json_str)
+    except json.JSONDecodeError:
+        raise ValueError("GOOGLE_CREDENTIALS_JSON is not valid JSON. Make sure you copied the entire file content.")
+    
     credentials = service_account.Credentials.from_service_account_info(
         creds_info, scopes=SCOPES
     )
@@ -76,7 +78,6 @@ async def gsc_get_search_analytics(site_url: str, days: int = 28, row_limit: int
         creds = get_credentials()
         service = build('webmasters', 'v3', credentials=creds)
         
-        from datetime import datetime, timedelta
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
         
@@ -123,7 +124,6 @@ async def gsc_get_top_pages(site_url: str, days: int = 28, row_limit: int = 10) 
         creds = get_credentials()
         service = build('webmasters', 'v3', credentials=creds)
         
-        from datetime import datetime, timedelta
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
         
@@ -154,6 +154,40 @@ async def gsc_get_top_pages(site_url: str, days: int = 28, row_limit: int = 10) 
     except Exception as e:
         return f"Error: {str(e)}"
 
+@mcp.tool()
+async def gsc_inspect_url(site_url: str, page_url: str) -> str:
+    """
+    Inspect a specific URL in Google Search Console.
+    
+    Args:
+        site_url: The property URL (e.g., https://example.com/)
+        page_url: The specific page to inspect (e.g., https://example.com/about)
+    """
+    try:
+        creds = get_credentials()
+        service = build('webmasters', 'v3', credentials=creds)
+        
+        request = {
+            'inspectionUrl': page_url,
+            'siteUrl': site_url
+        }
+        
+        response = service.urlInspection().index().inspect(body=request).execute()
+        result_data = response.get('inspectionResult', {})
+        
+        verdict = result_data.get('indexStatusResult', {}).get('verdict', 'Unknown')
+        coverage_state = result_data.get('indexStatusResult', {}).get('coverageState', 'Unknown')
+        last_crawled = result_data.get('indexStatusResult', {}).get('lastCrawlTime', 'Unknown')
+        
+        result = f"🔎 URL Inspection for {page_url}\n\n"
+        result += f"Verdict: {verdict}\n"
+        result += f"Coverage State: {coverage_state}\n"
+        result += f"Last Crawled: {last_crawled}\n"
+        
+        return result
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 # ========== GA4 TOOLS ==========
 
 @mcp.tool()
@@ -171,7 +205,7 @@ async def ga4_list_properties() -> str:
             properties = client.list_properties(filter=f"parent:{account.name}")
             for prop in properties:
                 count += 1
-                result += f"• {prop.display_name} (ID: {prop.name.split('/')[-1]})\n"
+                result += f"• {prop.display_name} (Property ID: {prop.name.split('/')[-1]})\n"
         
         if count == 0:
             return "No GA4 properties found. Make sure the service account has access."
@@ -194,7 +228,6 @@ async def ga4_run_report(property_id: str, days: int = 30, metrics: str = "activ
         creds = get_credentials()
         client = BetaAnalyticsDataClient(credentials=creds)
         
-        from datetime import datetime, timedelta
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
         
@@ -214,7 +247,6 @@ async def ga4_run_report(property_id: str, days: int = 30, metrics: str = "activ
         if not response.rows:
             return "No data returned for this report."
         
-        # Build header
         headers = [d.name for d in dimension_list] + [m.name for m in metric_list]
         result = "📈 GA4 Report\n\n"
         result += " | ".join(headers) + "\n"
@@ -238,19 +270,62 @@ async def ga4_top_countries(property_id: str, days: int = 30) -> str:
         days: Number of days to look back
     """
     try:
+        creds = get_credentials()
+        client = BetaAnalyticsDataClient(credentials=creds)
+        
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        
+        request = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+            metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
+            dimensions=[Dimension(name="country")],
+            limit=20
+        )
+        
+        response = client.run_report(request)
+        
+        if not response.rows:
+            return "No country data found."
+        
+        result = f"🌍 Top Countries (Last {days} days)\n\n"
+        result += f"{'Country':<25} {'Active Users':<15} {'Sessions':<12}\n"
+        result += "-" * 55 + "\n"
+        
+        for row in response.rows:
+            country = row.dimension_values[0].value[:23]
+            users = row.metric_values[0].value
+            sessions = row.metric_values[1].value
+            result += f"{country:<25} {users:<15} {sessions:<12}\n"
+        
+        return result
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+async def ga4_top_pages(property_id: str, days: int = 30) -> str:
+    """
+    Get top pages by views from GA4.
+    
+    Args:
+        property_id: Your GA4 Property ID
+        days: Number of days to look back
+    """
+    try:
         return await ga4_run_report(
             property_id=property_id,
             days=days,
-            metrics="activeUsers,sessions",
-            dimensions="country"
+            metrics="screenPageViews,sessions",
+            dimensions="pageTitle,pagePath"
         )
     except Exception as e:
         return f"Error: {str(e)}"
 
-# ========== HTTP SERVER SETUP (for Render) ==========
+# ========== HTTP SERVER SETUP ==========
 
 def create_app():
-    """Create the Starlette app with SSE transport for Render hosting."""
+    """Create the Starlette app with SSE transport for SnapDeploy hosting."""
     transport = SseServerTransport("/messages/")
     
     async def handle_sse(request):
@@ -273,7 +348,7 @@ def create_app():
 
 app = create_app()
 
-# For local testing with stdio (optional)
+# For local testing
 if __name__ == "__main__":
-    import asyncio
-    mcp.run()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
